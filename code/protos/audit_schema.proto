@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package audit;
+
+message Alert {
+  string package_name = 1;
+  string risk_type = 2; // "Slopsquatting", "Typosquatting", "Fresh Package"
+  string severity = 3;  // "CRITICAL", "HIGH", "WARNING", "INFO"
+  string description = 4;
+}
+
+message PackageInfo {
+  string name = 1;
+  string version = 2;
+  string upload_time = 3;
+  string author_email = 4;
+  bool exists_in_registry = 5;
+}
+
+message AuditReport {
+  string id = 1;
+  int64 timestamp = 2; // Unix timestamp
+  string tool_version = 3;
+  repeated PackageInfo packages = 4;
+  repeated Alert alerts = 5;
+}
