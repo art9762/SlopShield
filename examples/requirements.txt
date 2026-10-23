@@ -1,0 +1,6 @@
+requests==2.31.0
+flask>=2.0
+# Это комментарий
+pandas
+requessts       # Тайпосквоттинг!
+super-ai-lib    # Выдуманный пакет

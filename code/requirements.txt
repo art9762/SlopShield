@@ -1,6 +1,2 @@
-requests==2.31.0
-flask>=2.0
-# Это комментарий
-pandas
-requessts       # Тайпосквоттинг!
-super-ai-lib    # Выдуманный пакет
+# Install runtime dependencies from the repository root.
+-r ../requirements.txt
