@@ -2,9 +2,11 @@ import sys
 import argparse
 import time
 import uuid
-import re
 import os
+
 from datetime import datetime, timezone
+
+import requests
 
 from rich.console import Console
 from rich.table import Table
@@ -21,6 +23,7 @@ except ImportError:
 from pypi_client import PyPIClient
 from detector import TyposquatDetector
 from secure_logger import SecureLogger
+from input_requirements import package_name, parse_requirements_file
 
 console = Console()
 
@@ -38,35 +41,21 @@ def print_banner():
     panel = Panel(text, subtitle="Supply Chain Security Audit Tool", expand=False, border_style="blue")
     console.print(panel)
 
-def parse_requirements_file(filepath):
-    packages = []
-    if not os.path.exists(filepath):
-        console.print(f"[bold red]Error:[/bold red] File '{filepath}' not found.")
-        return []
-
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#') or line.startswith('-'):
-                    continue
-                match = re.match(r'^([a-zA-Z0-9_\-\.]+)', line)
-                if match:
-                    packages.append(match.group(1).lower())
-    except Exception as e:
-        console.print(f"[bold red]Error reading file:[/bold red] {e}")
-        sys.exit(1)
-        
-    return packages
-
 def run_audit(packages, save_path, password):
+    if save_path and not password:
+        console.print("[bold red]ERROR:[/bold red] --password or SLOPSHIELD_PASSWORD is required to save the report.")
+        return 2
+    try:
+        unique_packages = sorted({package_name(pkg) for pkg in packages})
+    except ValueError as exc:
+        console.print(str(exc), style="red", markup=False)
+        return 2
+
     print_banner()
-    
-    unique_packages = sorted(list(set(packages)))
     
     if not unique_packages:
         console.print("[yellow]No packages provided for audit. Use -f <file> or list packages manually.[/yellow]")
-        return
+        return 2
 
     client = PyPIClient()
     detector = TyposquatDetector()
@@ -74,7 +63,7 @@ def run_audit(packages, save_path, password):
     report = audit_schema_pb2.AuditReport()
     report.id = str(uuid.uuid4())
     report.timestamp = int(time.time())
-    report.tool_version = "1.2.0 (File Support)"
+    report.tool_version = "1.3.0 (CI Gate)"
     current_time = datetime.now(timezone.utc)
 
     table = Table(title=f"Audit Results ({len(unique_packages)} packages)", show_header=True, header_style="bold magenta")
@@ -121,8 +110,13 @@ def run_audit(packages, save_path, password):
 
             try:
                 metadata = client.get_metadata(pkg_name)
-            except Exception:
-                table.add_row(pkg_name, "Error", "UNKNOWN", "Network connectivity issue", style="yellow")
+            except (requests.RequestException, ValueError) as exc:
+                alert = report.alerts.add()
+                alert.package_name = pkg_name
+                alert.risk_type = "Registry Error"
+                alert.severity = "ERROR"
+                alert.description = f"Registry lookup incomplete: {exc}"
+                table.add_row(pkg_name, "Error", "UNKNOWN", "Registry lookup incomplete", style="yellow")
                 progress.advance(task)
                 continue
 
@@ -142,8 +136,8 @@ def run_audit(packages, save_path, password):
             
             else:
                 pkg_info_proto.exists_in_registry = True
-                info = metadata.get('info', {})
-                pkg_info_proto.version = info.get('version', 'unknown')
+                info = metadata['info']
+                pkg_info_proto.version = info['version']
                 
                 upload_dt = client.get_upload_time(metadata)
                 
@@ -162,35 +156,35 @@ def run_audit(packages, save_path, password):
                             status_text = "Fresh"
                             risk_style = "bold yellow"
                             risk_text = "WARNING"
-                            details = f"Uploaded {age_days} days ago"
+                            details = f"Latest release uploaded {age_days} days ago"
                         else:
                             details += f", Fresh ({age_days}d)"
                     else:
                         if not is_typo:
                             status_text = "Existing"
                             risk_style = "bold green"
-                            risk_text = "SAFE"
-                            details = f"Age: {age_days} days"
+                            risk_text = "LOW"
+                            details = f"Latest release age: {age_days} days"
                 else:
+                    alert = report.alerts.add()
+                    alert.package_name = pkg_name
+                    alert.risk_type = "Unknown Release Age"
+                    alert.severity = "WARNING"
+                    alert.description = "Latest release upload date is unavailable"
                     if not is_typo:
-                        status_text = "Existing"
-                        risk_style = "green"
-                        risk_text = "SAFE"
-                        details = "Date unknown"
+                        status_text = "Unknown Age"
+                        risk_style = "yellow"
+                        risk_text = "WARNING"
+                        details = "Latest release date unavailable"
 
                 table.add_row(pkg_name, status_text, Text(risk_text, style=risk_style), details)
             
-            time.sleep(0.05) 
             progress.advance(task)
 
     console.print(table)
     console.print()
 
     if save_path:
-        if not password:
-            console.print("[bold red]ERROR:[/bold red] --password is required to save the report.")
-            sys.exit(1)
-        
         with console.status("[bold cyan]Encrypting report...[/]"):
             try:
                 logger = SecureLogger(password)
@@ -198,36 +192,44 @@ def run_audit(packages, save_path, password):
                 logger.save(serialized_data, save_path)
                 
                 console.print(Panel(
-                    f"Report encrypted and saved to: [bold underline]{save_path}[/]\n"
-                    f"Session ID: {report.id}",
+                    Text(f"Report encrypted and saved to: {save_path}\nSession ID: {report.id}"),
                     title="Success",
                     border_style="green"
                 ))
-            except Exception as e:
-                console.print(f"[bold red]Failed to save report:[/bold red] {e}")
+            except (OSError, ValueError) as exc:
+                console.print(f"Failed to save report: {exc}", style="red", markup=False)
+                return 2
 
-def main():
+    if any(alert.severity == "ERROR" for alert in report.alerts):
+        return 2
+    return 1 if report.alerts else 0
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description="SlopShield - Supply Chain Attack Detector")
     
     parser.add_argument("packages", nargs="*", help="List of packages to check")
     parser.add_argument("-f", "--file", help="Path to requirements.txt file")
     parser.add_argument("--save", help="Path to save encrypted Protobuf report")
-    parser.add_argument("--password", help="Password for report encryption")
+    parser.add_argument("--password", help="Report password (prefer SLOPSHIELD_PASSWORD environment variable)")
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     all_packages = []
     
     if args.file:
-        file_pkgs = parse_requirements_file(args.file)
+        try:
+            file_pkgs = parse_requirements_file(args.file)
+        except ValueError as exc:
+            parser.error(str(exc))
         if file_pkgs:
-            console.print(f"[blue]Loaded {len(file_pkgs)} packages from {args.file}[/blue]")
+            console.print(f"Loaded {len(file_pkgs)} packages from {args.file}", style="blue", markup=False)
             all_packages.extend(file_pkgs)
     
     if args.packages:
         all_packages.extend(args.packages)
     
-    run_audit(all_packages, args.save, args.password)
+    return run_audit(all_packages, args.save, args.password or os.environ.get("SLOPSHIELD_PASSWORD"))
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

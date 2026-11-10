@@ -1,4 +1,5 @@
 import Levenshtein
+from packaging.utils import canonicalize_name
 
 class TyposquatDetector:
     # Hardcoded Top-List (сокращенный вариант для примера, в реальном проде список должен быть шире)
@@ -13,13 +14,15 @@ class TyposquatDetector:
         Проверяет имя пакета на сходство с популярными библиотеками.
         Returns: Имя оригинального пакета, если обнаружен тайпосквоттинг, иначе None.
         """
-        normalized_name = name.lower().replace('_', '-')
+        normalized_name = canonicalize_name(name)
         
         # Если пакет и так в белом списке - все ок
         if normalized_name in self.POPULAR_PACKAGES:
             return None
 
-        for pop_pkg in self.POPULAR_PACKAGES:
+        for pop_pkg in sorted(self.POPULAR_PACKAGES, key=lambda pkg: (
+            Levenshtein.distance(normalized_name, pkg), pkg
+        )):
             dist = Levenshtein.distance(normalized_name, pop_pkg)
             
             # Дистанция <= 2 считается подозрительной (например, reqests -> requests, dist=1)
